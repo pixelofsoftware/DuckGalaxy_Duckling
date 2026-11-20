@@ -1,0 +1,8 @@
+metadata:
+  name: testy_duckgalaxy
+  version: '1.0.0'
+  license: MIT
+dependencies:
+  duckgalaxy_logika:
+    source:
+      path: '../logika'

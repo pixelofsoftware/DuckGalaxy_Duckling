@@ -1,0 +1,256 @@
+#{
+    Testy logiki DuckGalaxy (bez okna): `duck run` w katalogu testy/.
+    Kod wyjścia to liczba nieudanych sprawdzeń (0 = wszystko w porządku).
+#}
+import duckgalaxy_logika as model;
+
+var nieudane: i32 = 0;
+var wszystkie: i32 = 0;
+
+fun sprawdz(warunek: bool, opis: str) -> () = {
+    wszystkie += 1;
+    if (warunek) {
+        print(f"  OK    {opis}\n".asSlice());
+    } else {
+        nieudane += 1;
+        print(f"  BLAD  {opis}\n".asSlice());
+    }
+}
+
+fun ileRaportow(g: ref model.Gra, rodzaj: i32) -> i32 = {
+    var ile: i32 = 0;
+    var i: i64 = 0;
+    while (i < g.raporty.length()) {
+        if (g.raporty.at(i).typ == rodzaj) ile += 1;
+        i += 1;
+    }
+    return ile;
+}
+
+fun ilePirackich(g: ref model.Gra) -> i32 = {
+    var ile: i32 = 0;
+    var i: i64 = 0;
+    while (i < g.floty.length()) {
+        if (g.floty.at(i).piracka) ile += 1;
+        i += 1;
+    }
+    return ile;
+}
+
+# Dwa stany są takie same, gdy ich zapisy dają te same liczby.
+fun takieSame(a: ref model.Gra, b: ref model.Gra) -> bool = {
+    let ta = model.zapiszDoTekstu(a);
+    let tb = model.zapiszDoTekstu(b);
+    let la = model.liczbyZTekstu(ta.asSlice());
+    let lb = model.liczbyZTekstu(tb.asSlice());
+    var zgodne = la.length() == lb.length();
+    var i: i64 = 0;
+    while (zgodne and i < la.length()) {
+        if (la.at(i) != lb.at(i)) zgodne = false;
+        i += 1;
+    }
+    return zgodne;
+}
+
+fun testStartu() -> () = {
+    print("Start\n");
+    var g = model.nowaGra(7u64);
+    sprawdz(g.metal == 300 and g.krysztal == 150 and g.mysliwce == 3, "300 metalu, 150 krysztalu, 3 mysliwce");
+    sprawdz(model.poziom(&g, 0) == 1 and model.poziom(&g, 1) == 1 and model.poziom(&g, 2) == 1, "budynki na poziomie 1");
+    sprawdz(g.bazy.length() == 4 and g.zdarzenia.length() == 1 and g.zdarzenia.at(0).czas == 120,
+        "4 bazy piratow, pierwszy ruch piratow po 2 minutach");
+}
+
+fun testProdukcji() -> () = {
+    print("Produkcja i budowa\n");
+    var g = model.nowaGra(7u64);
+    model.przewin(&g, 60);
+    sprawdz(g.metal == 340 and g.krysztal == 175, "minuta: +40 metalu (10 + 30 x poziom), +25 krysztalu");
+    var h = model.nowaGra(7u64);
+    var n: i32 = 0;
+    while (n < 60) { model.przewin(&h, 1); n += 1; }
+    sprawdz(h.metal == 340 and h.krysztal == 175, "60 razy po 1 s daje to samo co 60 s (reszta nie ginie)");
+
+    var b = model.nowaGra(7u64);
+    sprawdz(model.rozbuduj(&b, model.KOPALNIA_METALU) == model.OK and b.metal == 240 and b.krysztal == 135,
+        "rozbudowa kopalni: koszt 60/15 pobrany od razu");
+    sprawdz(model.rozbuduj(&b, model.STOCZNIA) == model.ZAJETE, "druga budowa naraz jest odrzucona");
+    model.przewin(&b, 29);
+    sprawdz(model.poziom(&b, 0) == 1, "po 29 s kopalnia jeszcze na poziomie 1");
+    model.przewin(&b, 1);
+    sprawdz(model.poziom(&b, 0) == 2 and b.budowa == -1 and ileRaportow(&b, model.R_BUDOWA) == 1, "po 30 s poziom 2 i raport");
+    var p = model.nowaGra(7u64);
+    model.rozbuduj(&p, model.KOPALNIA_METALU);
+    model.przewin(&p, 90);
+    sprawdz(p.metal == 240 + 20 + 70, "produkcja zmienia sie dokladnie w chwili konca budowy (30 s po 40/min, 60 s po 70/min)");
+    var biedny = model.nowaGra(7u64);
+    biedny.metal = 10;
+    sprawdz(model.rozbuduj(&biedny, model.STOCZNIA) == model.BRAK_ZASOBOW and biedny.metal == 10, "brak zasobow: nic sie nie zmienia");
+}
+
+fun testStatkow() -> () = {
+    print("Stocznia\n");
+    var g = model.nowaGra(7u64);
+    sprawdz(model.zamowStatek(&g, model.MYSLIWIEC) == model.OK and model.zamowStatek(&g, model.TRANSPORTOWIEC) == model.OK,
+        "zamowienie mysliwca i transportowca");
+    sprawdz(g.metal == 300 - 40 - 30 and g.krysztal == 150 - 10 - 30, "koszt obu pobrany od razu");
+    model.przewin(&g, 30);
+    sprawdz(g.mysliwce == 4 and g.transportowce == 0, "po 30 s gotowy mysliwiec");
+    model.przewin(&g, 40);
+    sprawdz(g.transportowce == 1 and g.kolejkaStatkow.length() == 0, "statki powstaja po kolei: transportowiec po kolejnych 40 s");
+}
+
+fun testWalki() -> () = {
+    print("Walka i lup\n");
+    var g = model.nowaGra(7u64);
+    let pewna = model.walka(&g, model.Sily(10, 0, 0), model.Sily(0, 0, 0));
+    sprawdz(pewna.atakujacyWygral and pewna.rundy == 0, "atak na pusta baze wygrany bez walki");
+    let sila = model.walka(&g, model.Sily(30, 0, 0), model.Sily(3, 0, 0));
+    sprawdz(sila.atakujacyWygral and sila.broniacy.mysliwce == 0, "30 mysliwcow pokonuje 3");
+    let slabi = model.walka(&g, model.Sily(1, 0, 0), model.Sily(20, 0, 0));
+    sprawdz(not slabi.atakujacyWygral and slabi.atakujacy.mysliwce == 0, "1 mysliwiec przeciw 20 ginie");
+    var a = model.nowaGra(99u64);
+    var b = model.nowaGra(99u64);
+    let wa = model.walka(&a, model.Sily(8, 2, 0), model.Sily(9, 0, 0));
+    let wb = model.walka(&b, model.Sily(8, 2, 0), model.Sily(9, 0, 0));
+    sprawdz(wa.atakujacy.mysliwce == wb.atakujacy.mysliwce and wa.broniacy.mysliwce == wb.broniacy.mysliwce and wa.rundy == wb.rundy,
+        "to samo ziarno: ta sama walka (powtarzalna losowosc)");
+    let l1 = model.policzLup(100, 1000, 1000, 50);
+    sprawdz(l1.metal == 50 and l1.krysztal == 50, "lup: po polowie ladowni na metal i krysztal");
+    let l2 = model.policzLup(100, 1000, 10, 50);
+    sprawdz(l2.krysztal == 5 and l2.metal == 95, "lup: wolne miejsce po krysztale wypelnia metal");
+}
+
+fun testMisji() -> () = {
+    print("Misje flot\n");
+    var g = model.nowaGra(7u64);
+    g.mysliwce = 20;
+    g.transportowce = 2;
+    sprawdz(model.wyslij(&g, 0, 21, 0) == model.ZLE_DANE, "nie mozna wyslac wiecej statkow, niz jest w kolonii");
+    sprawdz(model.wyslij(&g, 0, 20, 2) == model.OK and g.mysliwce == 0 and g.transportowce == 0,
+        "flota opuszcza kolonie od razu (niedostepna podczas misji)");
+    model.przewin(&g, 119);
+    sprawdz(ileRaportow(&g, model.R_ATAK_WYGRANY) == 0, "przed czasem lotu (120 s) nie ma walki");
+    let metalPrzed = g.metal;
+    model.przewin(&g, 1);
+    sprawdz(ileRaportow(&g, model.R_ATAK_WYGRANY) == 1 and g.bazy.at(0).pokonana, "po 120 s walka: baza pokonana, raport zapisany");
+    let lupMetal = g.raporty.at(g.raporty.length() - 1).metal;
+    let lupKrysztal = g.raporty.at(g.raporty.length() - 1).krysztal;
+    sprawdz(lupMetal > 0 and lupMetal + lupKrysztal <= 20 * 10 + 2 * 100, "lup zmiesci sie w ladowniach ocalalych statkow");
+    sprawdz(g.metal <= metalPrzed + 1, "lup nie trafia do kolonii przed powrotem floty");
+    model.przewin(&g, 120);
+    sprawdz(ileRaportow(&g, model.R_POWROT) == 1 and g.mysliwce > 0 and g.floty.length() == 0, "po kolejnych 120 s flota wraca");
+    sprawdz(model.wyslij(&g, 0, 1, 0) == model.BAZA_POKONANA, "pokonanej bazy nie atakujemy drugi raz");
+
+    var s = model.nowaGra(7u64);
+    model.wyslij(&s, 3, 1, 0);
+    model.przewin(&s, 360);
+    sprawdz(ileRaportow(&s, model.R_ATAK_PRZEGRANY) == 1 and s.mysliwce == 2,
+        "1 mysliwiec na twierdze: przegrana, statek stracony");
+}
+
+fun testPiratow() -> () = {
+    print("Piraci\n");
+    var g = model.nowaGra(7u64);
+    model.przewin(&g, 120);
+    sprawdz(g.bazy.at(0).mysliwce == 5 and g.bazy.at(3).mysliwce == 25, "co 2 minuty bazy odbudowuja po 1 mysliwcu");
+    model.przewin(&g, 600);
+    sprawdz(ileRaportow(&g, model.R_NAJAZD) == 1 and ilePirackich(&g) == 1, "pierwszy najazd dopiero w 12. minucie (czas na rozbudowe)");
+    sprawdz(g.floty.at(0).mysliwce == 10 and g.bazy.at(3).mysliwce == 20, "najazd to 1/3 mysliwcow najsilniejszej bazy (30 -> 10)");
+    let metalPrzed = g.metal;
+    model.przewin(&g, 360);
+    sprawdz(ileRaportow(&g, model.R_OBRONA_PRZEGRANA) + ileRaportow(&g, model.R_OBRONA_WYGRANA) == 1,
+        "najazd dociera po czasie lotu (6 min) i jest rozstrzygniety");
+    if (ileRaportow(&g, model.R_OBRONA_PRZEGRANA) == 1) {
+        sprawdz(g.metal < metalPrzed + 6 * 40, "przegrana obrona: piraci zabieraja czesc zasobow");
+    } else {
+        sprawdz(g.metal == metalPrzed + 6 * 40, "wygrana obrona: zasoby nietkniete");
+    }
+    var k = model.nowaGra(7u64);
+    k.mysliwce = 60;
+    model.przewin(&k, 720);
+    sprawdz(ileRaportow(&k, model.R_NAJAZD) == 0, "silna kolonia (60 mysliwcow) nie jest atakowana");
+}
+
+fun testKolejnosci() -> () = {
+    print("Kolejnosc zdarzen\n");
+    var g = model.nowaGra(7u64);
+    model.zaplanuj(&g, 50, model.STATEK_GOTOWY, 0);
+    model.zaplanuj(&g, 50, model.STATEK_GOTOWY, 1);
+    let pierwsze = model.najblizsze(&g);
+    sprawdz(g.zdarzenia.at(pierwsze).a == 0, "zdarzenia o tym samym czasie: najpierw dodane wczesniej");
+    model.doNastepnego(&g);
+    sprawdz(g.czas == 50, "krok do nastepnego zdarzenia przesuwa czas dokladnie do niego");
+}
+
+fun testZapisu() -> () = {
+    print("Zapis i odczyt\n");
+    var a = model.nowaGra(123u64);
+    a.metal = 2000;
+    a.krysztal = 1000;
+    a.mysliwce = 12;
+    a.transportowce = 2;
+    model.rozbuduj(&a, model.STOCZNIA);
+    model.zamowStatek(&a, model.MYSLIWIEC);
+    model.zamowStatek(&a, model.TRANSPORTOWIEC);
+    model.wyslij(&a, 1, 10, 2);
+    model.przewin(&a, 40);    # flota w locie, budowa stoczni i transportowiec w toku
+    let metalPrzed = a.metal;
+    let tekst = model.zapiszDoTekstu(&a);
+    var w = model.wczytajZTekstu(tekst.asSlice());
+    sprawdz(w.ok, "zapis wczytuje sie poprawnie");
+    sprawdz(takieSame(&a, &w.gra), "wczytany stan rowny zapisanemu");
+    sprawdz(w.gra.metal == metalPrzed and w.gra.budowa == model.STOCZNIA and w.gra.floty.length() == 1,
+        "po wczytaniu: te same zasoby (koszt nie pobrany drugi raz), budowa i flota w locie");
+    model.przewin(&a, 1000);
+    model.przewin(&w.gra, 1000);
+    sprawdz(takieSame(&a, &w.gra), "1000 s po wczytaniu: stan identyczny jak w grze bez zapisu");
+    sprawdz(ileRaportow(&w.gra, model.R_ATAK_WYGRANY) + ileRaportow(&w.gra, model.R_ATAK_PRZEGRANY) == 1,
+        "misja rozliczona dokladnie raz");
+
+    var m = model.nowaGra(5u64);
+    m.mysliwce = 20;
+    model.wyslij(&m, 0, 20, 0);
+    model.przewin(&m, 150);   # walka już była, flota wraca
+    let tekstPo = model.zapiszDoTekstu(&m);
+    var po = model.wczytajZTekstu(tekstPo.asSlice());
+    model.przewin(&po.gra, 200);
+    model.przewin(&m, 200);
+    sprawdz(ileRaportow(&po.gra, model.R_ATAK_WYGRANY) == 1 and ileRaportow(&po.gra, model.R_POWROT) == 1 and takieSame(&m, &po.gra),
+        "zapis w drodze powrotnej: walka nie powtarza sie, lup dociera raz");
+
+    sprawdz(model.zapiszGre(&a, "/tmp/duckgalaxy-test.txt"), "zapis do pliku");
+    var z = model.wczytajGre("/tmp/duckgalaxy-test.txt");
+    sprawdz(z.ok and takieSame(&a, &z.gra), "odczyt z pliku daje ten sam stan");
+    var zly = model.wczytajZTekstu("duckgalaxy-zapis-wersja 1\nczas 5 6\n");
+    sprawdz(not zly.ok, "uciety zapis jest odrzucony");
+    var brak = model.wczytajGre("/tmp/nie-ma-takiego-pliku-duckgalaxy.txt");
+    sprawdz(not brak.ok, "brak pliku zapisu: czytelny blad, bez awarii");
+}
+
+fun testWygranej() -> () = {
+    print("Wygrana\n");
+    var g = model.nowaGra(7u64);
+    g.bazy.at(1).pokonana = true;
+    g.bazy.at(2).pokonana = true;
+    g.bazy.at(3).pokonana = true;
+    g.mysliwce = 30;
+    model.wyslij(&g, 0, 30, 0);
+    model.przewin(&g, 120);
+    sprawdz(g.wygrana, "wszystkie bazy pokonane: wygrana");
+}
+
+fun main() -> i64 = {
+    print("Testy logiki: DuckGalaxy\n");
+    testStartu();
+    testProdukcji();
+    testStatkow();
+    testWalki();
+    testMisji();
+    testPiratow();
+    testKolejnosci();
+    testZapisu();
+    testWygranej();
+    print(f"Wynik: {wszystkie - nieudane}/{wszystkie} sprawdzen udanych\n".asSlice());
+    return nieudane as i64;
+}

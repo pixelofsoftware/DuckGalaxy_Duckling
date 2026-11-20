@@ -1,0 +1,939 @@
+#{
+    DuckGalaxy: logika kosmicznej gry strategicznej (temat P04 konkursu DuckQuest), bez okna.
+
+    Czas gry liczymy w całych sekundach (i64), zasoby w całych jednostkach (i64); produkcja
+    ma osobną resztę, więc nic nie ginie przy zaokrągleniach i zapis odtwarza stan co do
+    jednostki. Wszystkie zdarzenia (koniec budowy, gotowy statek, dotarcie i powrót floty,
+    ruch piratów) czekają w kolejce z czasem i numerem kolejnym; zdarzenia z tym samym
+    czasem obsługujemy w kolejności dodania. Koszt budowy i statku pobieramy w chwili
+    zlecenia. Flota na misji nie jest dostępna w kolonii. Walka używa generatora liczb
+    losowych z ziarnem zapisywanym razem ze stanem gry, więc jest powtarzalna.
+#}
+import core.builtins as builtins;
+import core.containers.*;
+
+# --- stałe gry ---------------------------------------------------------------------------------
+
+const KOPALNIA_METALU: i32 = 0;
+const KOPALNIA_KRYSZTALU: i32 = 1;
+const STOCZNIA: i32 = 2;
+const LICZBA_BUDYNKOW: i32 = 3;
+
+const MYSLIWIEC: i32 = 0;
+const TRANSPORTOWIEC: i32 = 1;
+
+const LICZBA_BAZ: i32 = 4;
+const TICK_PIRATOW: i64 = 120;      # co tyle sekund piraci odbudowują siły
+const NAJAZD_CO_TICKOW: i32 = 3;    # co trzeci tick (6 min) piraci rozważają najazd
+const PIERWSZY_NAJAZD: i32 = 6;     # ale nie przed 6. tickiem (12 min): czas na rozbudowę
+const MAKS_RAPORTOW: i64 = 40;
+const MAKS_RUND: i32 = 6;
+
+# Statusy akcji gracza.
+const OK: i32 = 0;
+const ZAJETE: i32 = 1;              # trwa już budowa
+const BRAK_ZASOBOW: i32 = 2;
+const ZLE_DANE: i32 = 3;            # np. za mało statków albo zła baza
+const BAZA_POKONANA: i32 = 4;
+
+# Rodzaje zdarzeń w kolejce.
+const BUDOWA_KONIEC: i32 = 1;
+const STATEK_GOTOWY: i32 = 2;
+const FLOTA_DOTARLA: i32 = 3;
+const FLOTA_WROCILA: i32 = 4;
+const PIRACI: i32 = 5;
+const NAJAZD_DOTARL: i32 = 6;
+
+# Rodzaje raportów.
+const R_BUDOWA: i32 = 1;
+const R_STATEK: i32 = 2;
+const R_ATAK_WYGRANY: i32 = 3;
+const R_ATAK_PRZEGRANY: i32 = 4;
+const R_OBRONA_WYGRANA: i32 = 5;
+const R_OBRONA_PRZEGRANA: i32 = 6;
+const R_POWROT: i32 = 7;
+const R_NAJAZD: i32 = 8;
+const R_ZAPIS: i32 = 9;
+
+# Stany flot.
+const LECI: i32 = 1;
+const WRACA: i32 = 2;
+
+# --- dane ----------------------------------------------------------------------------------------
+
+class Baza {
+    mysliwce: i32 = 0;
+    maks: i32 = 0;
+    metal: i64 = 0;
+    krysztal: i64 = 0;
+    pokonana: bool = false;
+}
+
+class Flota {
+    id: i64 = 0;
+    piracka: bool = false;
+    baza: i32 = 0;
+    mysliwce: i32 = 0;
+    transportowce: i32 = 0;
+    wylot: i64 = 0;
+    przylot: i64 = 0;
+    powrot: i64 = 0;
+    stan: i32 = LECI;
+    metal: i64 = 0;
+    krysztal: i64 = 0;
+}
+
+class Zdarzenie {
+    czas: i64 = 0;
+    nr: i64 = 0;
+    typ: i32 = 0;
+    a: i64 = 0;      # budynek, rodzaj statku albo numer floty
+}
+
+class Raport {
+    czas: i64 = 0;
+    typ: i32 = 0;
+    baza: i32 = 0;           # baza, budynek albo rodzaj statku
+    stratyMysliwcow: i32 = 0;
+    stratyTransportowcow: i32 = 0;
+    stratyWroga: i32 = 0;
+    metal: i64 = 0;
+    krysztal: i64 = 0;
+}
+
+fun listaI32() -> List[i32] = { var l: List[i32]; return l; }
+fun listaBaz() -> List[Baza] = { var l: List[Baza]; return l; }
+fun listaFlot() -> List[Flota] = { var l: List[Flota]; return l; }
+fun listaZdarzen() -> List[Zdarzenie] = { var l: List[Zdarzenie]; return l; }
+fun listaRaportow() -> List[Raport] = { var l: List[Raport]; return l; }
+
+fun startoweBudynki() -> List[i32] = {
+    var b: List[i32];
+    b.push(1);
+    b.push(1);
+    b.push(1);
+    return b;
+}
+
+class Gra {
+    czas: i64 = 0;
+    metal: i64 = 300;
+    krysztal: i64 = 150;
+    resztaMetalu: i64 = 0;
+    resztaKrysztalu: i64 = 0;
+    budynki: List[i32] = startoweBudynki();
+    budowa: i32 = -1;          # rozbudowywany budynek albo -1
+    koniecBudowy: i64 = 0;
+    mysliwce: i32 = 0;         # statki w kolonii
+    transportowce: i32 = 0;
+    kolejkaStatkow: List[i32] = listaI32();   # pierwszy jest właśnie budowany
+    koniecStatku: i64 = 0;
+    bazy: List[Baza] = listaBaz();
+    floty: List[Flota] = listaFlot();
+    zdarzenia: List[Zdarzenie] = listaZdarzen();
+    raporty: List[Raport] = listaRaportow();
+    nastepnyNr: i64 = 1;
+    nastepneId: i64 = 1;
+    tickPiratow: i32 = 0;
+    los: u64 = 1u64;
+    wygrana: bool = false;
+}
+
+# --- opis świata ----------------------------------------------------------------------------------
+
+fun nazwaBazy(b: i32) -> str = {
+    if (b == 0) return "Pas Kwak";
+    if (b == 1) return "Mglawica Krzyzowka";
+    if (b == 2) return "Stacja Bekas";
+    return "Twierdza Kaczy Kil";
+}
+
+fun nazwaBudynku(b: i32) -> str = {
+    if (b == KOPALNIA_METALU) return "Kopalnia metalu";
+    if (b == KOPALNIA_KRYSZTALU) return "Kopalnia krysztalu";
+    return "Stocznia";
+}
+
+fun nazwaStatku(t: i32) -> str = {
+    if (t == MYSLIWIEC) return "Mysliwiec";
+    return "Transportowiec";
+}
+
+# Czas lotu z kolonii do bazy w sekundach gry (w jedną stronę).
+fun odleglosc(b: i32) -> i64 = {
+    if (b == 0) return 120;
+    if (b == 1) return 180;
+    if (b == 2) return 240;
+    return 360;
+}
+
+fun startowaBaza(b: i32) -> Baza = {
+    if (b == 0) return Baza(4, 6, 300, 150, false);
+    if (b == 1) return Baza(8, 12, 600, 300, false);
+    if (b == 2) return Baza(14, 20, 1000, 600, false);
+    return Baza(24, 35, 2000, 1200, false);
+}
+
+# --- ekonomia ---------------------------------------------------------------------------------------
+
+fun poziom(g: ref Gra, budynek: i32) -> i32 = g.budynki.at(budynek as i64);
+
+# Produkcja na minutę gry.
+fun produkcjaMetalu(g: ref Gra) -> i64 = (10 + 30 * poziom(g, KOPALNIA_METALU)) as i64;
+fun produkcjaKrysztalu(g: ref Gra) -> i64 = (5 + 20 * poziom(g, KOPALNIA_KRYSZTALU)) as i64;
+
+# Liczba trójkątna L(L+1)/2: koszt i czas rosną z poziomem coraz szybciej.
+fun trojkatna(n: i32) -> i64 = ((n * (n + 1)) / 2) as i64;
+
+class Koszt { metal: i64 = 0; krysztal: i64 = 0; czas: i64 = 0; }
+
+fun kosztRozbudowy(g: ref Gra, budynek: i32) -> Koszt = {
+    let t = trojkatna(poziom(g, budynek));
+    if (budynek == KOPALNIA_METALU) return Koszt(60 * t, 15 * t, 30 * t);
+    if (budynek == KOPALNIA_KRYSZTALU) return Koszt(48 * t, 24 * t, 30 * t);
+    return Koszt(100 * t, 60 * t, 45 * t);
+}
+
+# Statki: wyższa stocznia buduje szybciej (czas razy 2 / (poziom + 1)).
+fun kosztStatku(g: ref Gra, rodzaj: i32) -> Koszt = {
+    let mnoznik = (poziom(g, STOCZNIA) + 1) as i64;
+    if (rodzaj == MYSLIWIEC) return Koszt(40, 10, (30 * 2) / mnoznik);
+    return Koszt(30, 30, (40 * 2) / mnoznik);
+}
+
+fun atak(rodzaj: i32) -> i64 = { if (rodzaj == MYSLIWIEC) return 10; return 1; }
+fun pancerz(rodzaj: i32) -> i64 = { if (rodzaj == MYSLIWIEC) return 30; return 20; }
+fun ladownosc(rodzaj: i32) -> i64 = { if (rodzaj == MYSLIWIEC) return 10; return 100; }
+const ATAK_DZIALA: i64 = 8;
+const PANCERZ_DZIALA: i64 = 40;
+
+fun dzialaKolonii(g: ref Gra) -> i32 = 2 * poziom(g, STOCZNIA);
+
+# Produkcja za dt sekund; reszta z dzielenia przechodzi dalej.
+fun produkuj(g: ref Gra, dt: i64) -> () = {
+    if (dt > 0) {
+        g.resztaMetalu += produkcjaMetalu(g) * dt;
+        g.metal += g.resztaMetalu / 60;
+        g.resztaMetalu = g.resztaMetalu % 60;
+        g.resztaKrysztalu += produkcjaKrysztalu(g) * dt;
+        g.krysztal += g.resztaKrysztalu / 60;
+        g.resztaKrysztalu = g.resztaKrysztalu % 60;
+    }
+}
+
+# --- losowanie --------------------------------------------------------------------------------------
+
+fun nastepnaLiczba(g: ref Gra) -> u64 = {
+    var s: u64 = g.los;
+    s = s ^ (s >> 12u64);
+    s = s ^ (s << 25u64);
+    s = s ^ (s >> 27u64);
+    g.los = s;
+    return s * 0x2545f4914f6cdd1du64;
+}
+
+fun losuj(g: ref Gra, od: i64, doWlacznie: i64) -> i64 = {
+    let zakres = (doWlacznie - od + 1) as u64;
+    return od + (nastepnaLiczba(g) % zakres) as i64;
+}
+
+# --- kolejka zdarzeń i raporty -----------------------------------------------------------------------
+
+fun zaplanuj(g: ref Gra, kiedy: i64, rodzaj: i32, parametr: i64) -> () = {
+    g.zdarzenia.push(Zdarzenie(kiedy, g.nastepnyNr, rodzaj, parametr));
+    g.nastepnyNr += 1;
+}
+
+# Indeks najbliższego zdarzenia (najmniejszy czas, przy remisie najmniejszy numer) albo -1.
+fun najblizsze(g: ref Gra) -> i64 = {
+    var najlepsze: i64 = -1;
+    var i: i64 = 0;
+    while (i < g.zdarzenia.length()) {
+        if (najlepsze < 0) najlepsze = i;
+        else {
+            let czasI = g.zdarzenia.at(i).czas;
+            let czasN = g.zdarzenia.at(najlepsze).czas;
+            if (czasI < czasN or (czasI == czasN and g.zdarzenia.at(i).nr < g.zdarzenia.at(najlepsze).nr)) najlepsze = i;
+        }
+        i += 1;
+    }
+    return najlepsze;
+}
+
+fun usunZdarzenie(g: ref Gra, indeks: i64) -> () = {
+    var reszta: List[Zdarzenie];
+    var i: i64 = 0;
+    while (i < g.zdarzenia.length()) {
+        if (i != indeks) {
+            var z: Zdarzenie = g.zdarzenia.at(i);
+            reszta.push(z);
+        }
+        i += 1;
+    }
+    g.zdarzenia = move reszta;
+}
+
+fun raportuj(g: ref Gra, r: Raport) -> () = {
+    var nowe: List[Raport];
+    var start: i64 = 0;
+    if (g.raporty.length() >= MAKS_RAPORTOW) start = g.raporty.length() - MAKS_RAPORTOW + 1;
+    var i: i64 = start;
+    while (i < g.raporty.length()) {
+        var stary: Raport = g.raporty.at(i);
+        nowe.push(stary);
+        i += 1;
+    }
+    nowe.push(r);
+    g.raporty = move nowe;
+}
+
+fun indeksFloty(g: ref Gra, id: i64) -> i64 = {
+    var wynik: i64 = -1;
+    var i: i64 = 0;
+    while (i < g.floty.length()) {
+        if (g.floty.at(i).id == id) wynik = i;
+        i += 1;
+    }
+    return wynik;
+}
+
+fun usunFlote(g: ref Gra, id: i64) -> () = {
+    var reszta: List[Flota];
+    var i: i64 = 0;
+    while (i < g.floty.length()) {
+        if (g.floty.at(i).id != id) {
+            var f: Flota = g.floty.at(i);
+            reszta.push(f);
+        }
+        i += 1;
+    }
+    g.floty = move reszta;
+}
+
+# --- walka ------------------------------------------------------------------------------------------------
+
+class Sily { mysliwce: i32 = 0; transportowce: i32 = 0; dziala: i32 = 0; }
+
+class WynikWalki {
+    atakujacy: Sily = Sily();     # ocaleli
+    broniacy: Sily = Sily();
+    atakujacyWygral: bool = false;
+    rundy: i32 = 0;
+}
+
+fun liczebnosc(s: ref Sily) -> i64 = (s.mysliwce + s.transportowce + s.dziala) as i64;
+
+fun silaOgnia(s: ref Sily) -> i64 = {
+    return (s.mysliwce as i64) * atak(MYSLIWIEC) + (s.transportowce as i64) * atak(TRANSPORTOWIEC)
+        + (s.dziala as i64) * ATAK_DZIALA;
+}
+
+class Obrazenia { mysliwce: i64 = 0; transportowce: i64 = 0; dziala: i64 = 0; }
+
+# Obrażenia dzielimy między grupy proporcjonalnie do liczby jednostek; nadwyżka
+# ponad pancerz przechodzi do następnej rundy tej samej walki.
+fun zadaj(cel: ref Sily, zapas: ref Obrazenia, obrazenia: i64) -> Sily = {
+    let wszystkich = liczebnosc(cel);
+    var po = Sily(cel.mysliwce, cel.transportowce, cel.dziala);
+    if (wszystkich > 0) {
+        zapas.mysliwce += obrazenia * (cel.mysliwce as i64) / wszystkich;
+        zapas.transportowce += obrazenia * (cel.transportowce as i64) / wszystkich;
+        zapas.dziala += obrazenia * (cel.dziala as i64) / wszystkich;
+        var zabici: i64 = zapas.mysliwce / pancerz(MYSLIWIEC);
+        if (zabici > cel.mysliwce as i64) zabici = cel.mysliwce as i64;
+        zapas.mysliwce -= zabici * pancerz(MYSLIWIEC);
+        po.mysliwce = cel.mysliwce - (zabici as i32);
+        var zabiciT: i64 = zapas.transportowce / pancerz(TRANSPORTOWIEC);
+        if (zabiciT > cel.transportowce as i64) zabiciT = cel.transportowce as i64;
+        zapas.transportowce -= zabiciT * pancerz(TRANSPORTOWIEC);
+        po.transportowce = cel.transportowce - (zabiciT as i32);
+        var zabiciD: i64 = zapas.dziala / PANCERZ_DZIALA;
+        if (zabiciD > cel.dziala as i64) zabiciD = cel.dziala as i64;
+        zapas.dziala -= zabiciD * PANCERZ_DZIALA;
+        po.dziala = cel.dziala - (zabiciD as i32);
+    }
+    return po;
+}
+
+#{
+    Walka bez decyzji gracza, najwyżej 6 rund. W każdej rundzie obie strony strzelają
+    jednocześnie: siła ognia (myśliwiec 10, transportowiec 1, działo 8) razy losowy mnożnik
+    80-120%. Atakujący wygrywa, gdy obrońca nie ma już jednostek, a on ma; po 6 rundach
+    bez rozstrzygnięcia atakujący się wycofuje (przegrana bez łupu).
+#}
+fun walka(g: ref Gra, atakujacy: Sily, broniacy: Sily) -> WynikWalki = {
+    var a = atakujacy;
+    var b = broniacy;
+    var zapasA = Obrazenia();
+    var zapasB = Obrazenia();
+    var runda: i32 = 0;
+    while (runda < MAKS_RUND and liczebnosc(&a) > 0 and liczebnosc(&b) > 0) {
+        let ogienA = silaOgnia(&a) * losuj(g, 80, 120) / 100;
+        let ogienB = silaOgnia(&b) * losuj(g, 80, 120) / 100;
+        let poA = zadaj(&a, &zapasA, ogienB);
+        let poB = zadaj(&b, &zapasB, ogienA);
+        a = poA;
+        b = poB;
+        runda += 1;
+    }
+    var wynik = WynikWalki();
+    wynik.atakujacy = a;
+    wynik.broniacy = b;
+    wynik.atakujacyWygral = liczebnosc(&a) > 0 and liczebnosc(&b) == 0;
+    wynik.rundy = runda;
+    return wynik;
+}
+
+# Łup: tyle, ile zmieści się w ładowniach, najwyżej podany procent zasobów celu,
+# po połowie pojemności na metal i kryształ (niewykorzystane miejsce przechodzi na drugi).
+class Lup { metal: i64 = 0; krysztal: i64 = 0; }
+
+fun policzLup(miejsce: i64, metal: i64, krysztal: i64, procent: i64) -> Lup = {
+    let dostepnyMetal = metal * procent / 100;
+    let dostepnyKrysztal = krysztal * procent / 100;
+    var wynik = Lup();
+    wynik.metal = dostepnyMetal;
+    if (wynik.metal > miejsce / 2) wynik.metal = miejsce / 2;
+    wynik.krysztal = dostepnyKrysztal;
+    if (wynik.krysztal > miejsce - wynik.metal) wynik.krysztal = miejsce - wynik.metal;
+    if (wynik.metal + wynik.krysztal < miejsce and wynik.metal < dostepnyMetal) {
+        var wiecej: i64 = miejsce - wynik.metal - wynik.krysztal;
+        if (wiecej > dostepnyMetal - wynik.metal) wiecej = dostepnyMetal - wynik.metal;
+        wynik.metal += wiecej;
+    }
+    return wynik;
+}
+
+fun pojemnosc(mysliwce: i32, transportowce: i32) -> i64 = {
+    return (mysliwce as i64) * ladownosc(MYSLIWIEC) + (transportowce as i64) * ladownosc(TRANSPORTOWIEC);
+}
+
+# --- nowa gra ----------------------------------------------------------------------------------------------
+
+fun nowaGra(ziarno: u64) -> Gra = {
+    var g = Gra();
+    if (ziarno == 0u64) g.los = 1u64;
+    else g.los = ziarno;
+    var b: i32 = 0;
+    while (b < LICZBA_BAZ) { g.bazy.push(startowaBaza(b)); b += 1; }
+    g.mysliwce = 3;
+    zaplanuj(&g, TICK_PIRATOW, PIRACI, 0);
+    return g;
+}
+
+# --- akcje gracza ---------------------------------------------------------------------------------------------
+
+# Rozbudowa budynku: koszt od razu, budynek zyskuje poziom po upływie czasu. Jedna naraz.
+fun rozbuduj(g: ref Gra, budynek: i32) -> i32 = {
+    if (budynek < 0 or budynek >= LICZBA_BUDYNKOW) return ZLE_DANE;
+    if (g.budowa >= 0) return ZAJETE;
+    let k = kosztRozbudowy(g, budynek);
+    if (g.metal < k.metal or g.krysztal < k.krysztal) return BRAK_ZASOBOW;
+    g.metal -= k.metal;
+    g.krysztal -= k.krysztal;
+    g.budowa = budynek;
+    g.koniecBudowy = g.czas + k.czas;
+    zaplanuj(g, g.koniecBudowy, BUDOWA_KONIEC, budynek as i64);
+    return OK;
+}
+
+fun zacznijStatek(g: ref Gra) -> () = {
+    if (g.kolejkaStatkow.length() > 0) {
+        let k = kosztStatku(g, g.kolejkaStatkow.at(0));
+        g.koniecStatku = g.czas + k.czas;
+        zaplanuj(g, g.koniecStatku, STATEK_GOTOWY, g.kolejkaStatkow.at(0) as i64);
+    }
+}
+
+# Zamówienie statku: koszt od razu, statki powstają po kolei w stoczni.
+fun zamowStatek(g: ref Gra, rodzaj: i32) -> i32 = {
+    if (rodzaj != MYSLIWIEC and rodzaj != TRANSPORTOWIEC) return ZLE_DANE;
+    let k = kosztStatku(g, rodzaj);
+    if (g.metal < k.metal or g.krysztal < k.krysztal) return BRAK_ZASOBOW;
+    g.metal -= k.metal;
+    g.krysztal -= k.krysztal;
+    g.kolejkaStatkow.push(rodzaj);
+    if (g.kolejkaStatkow.length() == 1) zacznijStatek(g);
+    return OK;
+}
+
+# Wysłanie floty z kolonii na bazę piratów. Statki opuszczają kolonię od razu.
+fun wyslij(g: ref Gra, baza: i32, mysliwce: i32, transportowce: i32) -> i32 = {
+    if (baza < 0 or baza >= LICZBA_BAZ) return ZLE_DANE;
+    if (mysliwce < 0 or transportowce < 0 or mysliwce + transportowce == 0) return ZLE_DANE;
+    if (mysliwce > g.mysliwce or transportowce > g.transportowce) return ZLE_DANE;
+    if (g.bazy.at(baza as i64).pokonana) return BAZA_POKONANA;
+    var f = Flota();
+    f.id = g.nastepneId;
+    g.nastepneId += 1;
+    f.baza = baza;
+    f.mysliwce = mysliwce;
+    f.transportowce = transportowce;
+    f.wylot = g.czas;
+    f.przylot = g.czas + odleglosc(baza);
+    f.powrot = g.czas + 2 * odleglosc(baza);
+    f.stan = LECI;
+    g.mysliwce -= mysliwce;
+    g.transportowce -= transportowce;
+    g.floty.push(f);
+    zaplanuj(g, f.przylot, FLOTA_DOTARLA, f.id);
+    return OK;
+}
+
+# --- obsługa zdarzeń ---------------------------------------------------------------------------------------------
+
+fun zakonczBudowe(g: ref Gra, budynek: i32) -> () = {
+    g.budynki.at(budynek as i64) += 1;
+    g.budowa = -1;
+    raportuj(g, Raport(g.czas, R_BUDOWA, budynek, poziom(g, budynek), 0, 0, 0, 0));
+}
+
+fun statekGotowy(g: ref Gra, rodzaj: i32) -> () = {
+    if (rodzaj == MYSLIWIEC) g.mysliwce += 1;
+    else g.transportowce += 1;
+    var reszta: List[i32];
+    var i: i64 = 1;
+    while (i < g.kolejkaStatkow.length()) { reszta.push(g.kolejkaStatkow.at(i)); i += 1; }
+    g.kolejkaStatkow = move reszta;
+    raportuj(g, Raport(g.czas, R_STATEK, rodzaj, 0, 0, 0, 0, 0));
+    zacznijStatek(g);
+}
+
+# Flota gracza dociera do bazy: walka z myśliwcami piratów, łup do 50% zasobów bazy.
+fun flotaDotarla(g: ref Gra, id: i64) -> () = {
+    let i = indeksFloty(g, id);
+    if (i >= 0) {
+        var f: Flota = g.floty.at(i);
+        var baza: Baza = g.bazy.at(f.baza as i64);
+        let w = walka(g, Sily(f.mysliwce, f.transportowce, 0), Sily(baza.mysliwce, 0, 0));
+        let stratyM = f.mysliwce - w.atakujacy.mysliwce;
+        let stratyT = f.transportowce - w.atakujacy.transportowce;
+        let stratyWroga = baza.mysliwce - w.broniacy.mysliwce;
+        baza.mysliwce = w.broniacy.mysliwce;
+        f.mysliwce = w.atakujacy.mysliwce;
+        f.transportowce = w.atakujacy.transportowce;
+        if (w.atakujacyWygral) {
+            let lup = policzLup(pojemnosc(f.mysliwce, f.transportowce), baza.metal, baza.krysztal, 50);
+            baza.metal -= lup.metal;
+            baza.krysztal -= lup.krysztal;
+            f.metal = lup.metal;
+            f.krysztal = lup.krysztal;
+            baza.pokonana = true;   # baza bez myśliwców przestaje działać
+            raportuj(g, Raport(g.czas, R_ATAK_WYGRANY, f.baza, stratyM, stratyT, stratyWroga, lup.metal, lup.krysztal));
+        } else {
+            raportuj(g, Raport(g.czas, R_ATAK_PRZEGRANY, f.baza, stratyM, stratyT, stratyWroga, 0, 0));
+        }
+        g.bazy.at(f.baza as i64) = baza;
+        if (f.mysliwce + f.transportowce > 0) {
+            f.stan = WRACA;
+            g.floty.at(i) = f;
+            zaplanuj(g, f.powrot, FLOTA_WROCILA, f.id);
+        } else {
+            usunFlote(g, id);
+        }
+        var wszystkiePokonane = true;
+        var b: i64 = 0;
+        while (b < g.bazy.length()) {
+            if (not g.bazy.at(b).pokonana) wszystkiePokonane = false;
+            b += 1;
+        }
+        if (wszystkiePokonane) g.wygrana = true;
+    }
+}
+
+fun flotaWrocila(g: ref Gra, id: i64) -> () = {
+    let i = indeksFloty(g, id);
+    if (i >= 0) {
+        var f: Flota = g.floty.at(i);
+        g.mysliwce += f.mysliwce;
+        g.transportowce += f.transportowce;
+        g.metal += f.metal;
+        g.krysztal += f.krysztal;
+        raportuj(g, Raport(g.czas, R_POWROT, f.baza, f.mysliwce, f.transportowce, 0, f.metal, f.krysztal));
+        usunFlote(g, id);
+    }
+}
+
+#{
+    Piraci (przeciwnik sterowany przez program), co 2 minuty gry: każda niepokonana baza
+    odbudowuje 1 myśliwca (do limitu) i trochę zasobów. Co trzeci raz najsilniejsza baza
+    rusza na kolonię, jeśli ma co najmniej 4 myśliwce i więcej niż połowę
+    siły obrony kolonii (myśliwce w kolonii i działa stoczni). Najazd liczy 1/3 myśliwców
+    bazy; pierwszy jest możliwy w 12. minucie gry.
+#}
+fun ruchPiratow(g: ref Gra) -> () = {
+    g.tickPiratow += 1;
+    var b: i64 = 0;
+    while (b < g.bazy.length()) {
+        if (not g.bazy.at(b).pokonana) {
+            if (g.bazy.at(b).mysliwce < g.bazy.at(b).maks) g.bazy.at(b).mysliwce += 1;
+            g.bazy.at(b).metal += 20;
+            g.bazy.at(b).krysztal += 10;
+        }
+        b += 1;
+    }
+    if (g.tickPiratow % NAJAZD_CO_TICKOW == 0 and g.tickPiratow >= PIERWSZY_NAJAZD) {
+        var najsilniejsza: i64 = -1;
+        var k: i64 = 0;
+        while (k < g.bazy.length()) {
+            if (not g.bazy.at(k).pokonana) {
+                if (najsilniejsza < 0) najsilniejsza = k;
+                else if (g.bazy.at(k).mysliwce > g.bazy.at(najsilniejsza).mysliwce) najsilniejsza = k;
+            }
+            k += 1;
+        }
+        if (najsilniejsza >= 0) {
+            let sila = g.bazy.at(najsilniejsza).mysliwce;
+            let obrona = g.mysliwce + dzialaKolonii(g);
+            if (sila >= 4 and sila * 2 > obrona) {
+                var f = Flota();
+                f.id = g.nastepneId;
+                g.nastepneId += 1;
+                f.piracka = true;
+                f.baza = najsilniejsza as i32;
+                f.mysliwce = sila / 3;
+                f.wylot = g.czas;
+                f.przylot = g.czas + odleglosc(f.baza);
+                f.powrot = f.przylot;
+                g.bazy.at(najsilniejsza).mysliwce -= f.mysliwce;
+                g.floty.push(f);
+                zaplanuj(g, f.przylot, NAJAZD_DOTARL, f.id);
+                raportuj(g, Raport(g.czas, R_NAJAZD, f.baza, 0, 0, f.mysliwce, 0, 0));
+            }
+        }
+    }
+    zaplanuj(g, g.czas + TICK_PIRATOW, PIRACI, 0);
+}
+
+# Najazd dociera do kolonii: walka z myśliwcami, transportowcami i działami kolonii.
+# Wygrani piraci zabierają do 25% zasobów (ile zmieszczą) i wracają do bazy; działa się odbudowują.
+fun najazdDotarl(g: ref Gra, id: i64) -> () = {
+    let i = indeksFloty(g, id);
+    if (i >= 0) {
+        var f: Flota = g.floty.at(i);
+        let w = walka(g, Sily(f.mysliwce, 0, 0), Sily(g.mysliwce, g.transportowce, dzialaKolonii(g)));
+        let stratyM = g.mysliwce - w.broniacy.mysliwce;
+        let stratyT = g.transportowce - w.broniacy.transportowce;
+        let stratyWroga = f.mysliwce - w.atakujacy.mysliwce;
+        g.mysliwce = w.broniacy.mysliwce;
+        g.transportowce = w.broniacy.transportowce;
+        if (w.atakujacyWygral) {
+            let lup = policzLup(pojemnosc(w.atakujacy.mysliwce, 0), g.metal, g.krysztal, 25);
+            g.metal -= lup.metal;
+            g.krysztal -= lup.krysztal;
+            raportuj(g, Raport(g.czas, R_OBRONA_PRZEGRANA, f.baza, stratyM, stratyT, stratyWroga, lup.metal, lup.krysztal));
+        } else {
+            raportuj(g, Raport(g.czas, R_OBRONA_WYGRANA, f.baza, stratyM, stratyT, stratyWroga, 0, 0));
+        }
+        # Ocaleli piraci wracają do swojej bazy (bez osobnego lotu powrotnego).
+        if (not g.bazy.at(f.baza as i64).pokonana) g.bazy.at(f.baza as i64).mysliwce += w.atakujacy.mysliwce;
+        usunFlote(g, id);
+    }
+}
+
+fun obsluz(g: ref Gra, z: Zdarzenie) -> () = {
+    if (z.typ == BUDOWA_KONIEC) zakonczBudowe(g, z.a as i32);
+    if (z.typ == STATEK_GOTOWY) statekGotowy(g, z.a as i32);
+    if (z.typ == FLOTA_DOTARLA) flotaDotarla(g, z.a);
+    if (z.typ == FLOTA_WROCILA) flotaWrocila(g, z.a);
+    if (z.typ == PIRACI) ruchPiratow(g);
+    if (z.typ == NAJAZD_DOTARL) najazdDotarl(g, z.a);
+}
+
+# --- upływ czasu -------------------------------------------------------------------------------------------------------
+
+#{
+    Przesuń czas o podaną liczbę sekund gry. Zdarzenia przed końcem przedziału obsługujemy
+    po kolei; produkcja do każdego zdarzenia liczy się według poziomów kopalń sprzed niego.
+#}
+fun przewin(g: ref Gra, sekundy: i64) -> () = {
+    if (sekundy > 0) {
+        let cel = g.czas + sekundy;
+        var indeks = najblizsze(g);
+        while (indeks >= 0 and g.zdarzenia.at(indeks).czas <= cel) {
+            var z: Zdarzenie = g.zdarzenia.at(indeks);
+            produkuj(g, z.czas - g.czas);
+            g.czas = z.czas;
+            usunZdarzenie(g, indeks);
+            obsluz(g, z);
+            indeks = najblizsze(g);
+        }
+        produkuj(g, cel - g.czas);
+        g.czas = cel;
+    }
+}
+
+# Przeskok do najbliższego zdarzenia (tryb krok po kroku).
+fun doNastepnego(g: ref Gra) -> () = {
+    let indeks = najblizsze(g);
+    if (indeks >= 0) {
+        var kiedy: i64 = g.zdarzenia.at(indeks).czas;
+        if (kiedy <= g.czas) kiedy = g.czas + 1;
+        przewin(g, kiedy - g.czas);
+    }
+}
+
+# --- zapis i odczyt ---------------------------------------------------------------------------------------------------
+
+fun dopisz(tekst: ref String, etykieta: str, liczby: ref List[i64]) -> () = {
+    tekst.append(etykieta);
+    var i: i64 = 0;
+    while (i < liczby.length()) {
+        tekst.append(" ");
+        tekst.append(liczby.at(i).toString());
+        i += 1;
+    }
+    tekst.append("\n");
+}
+
+fun b2i(wartosc: bool) -> i64 = { if (wartosc) return 1; return 0; }
+
+#{
+    Zapis do tekstu: wiersze "etykieta liczba liczba ...". Odczyt bierze same liczby
+    w ustalonej kolejności, więc etykiety służą tylko człowiekowi.
+#}
+fun zapiszDoTekstu(g: ref Gra) -> String = {
+    var t: String;
+    var w: List[i64];
+    w.push(1);
+    dopisz(&t, "duckgalaxy-zapis-wersja", &w);
+    var stan: List[i64];
+    stan.push(g.czas); stan.push(g.metal); stan.push(g.krysztal); stan.push(g.resztaMetalu); stan.push(g.resztaKrysztalu);
+    dopisz(&t, "czas-metal-krysztal-reszty", &stan);
+    var bud: List[i64];
+    bud.push(poziom(g, 0) as i64); bud.push(poziom(g, 1) as i64); bud.push(poziom(g, 2) as i64);
+    bud.push(g.budowa as i64); bud.push(g.koniecBudowy);
+    dopisz(&t, "budynki-budowa-koniec", &bud);
+    var st: List[i64];
+    st.push(g.mysliwce as i64); st.push(g.transportowce as i64); st.push(g.koniecStatku);
+    st.push(g.kolejkaStatkow.length());
+    var q: i64 = 0;
+    while (q < g.kolejkaStatkow.length()) { st.push(g.kolejkaStatkow.at(q) as i64); q += 1; }
+    dopisz(&t, "statki-kolejka", &st);
+    var ogolne: List[i64];
+    ogolne.push(g.los as i64); ogolne.push(g.nastepnyNr); ogolne.push(g.nastepneId);
+    ogolne.push(g.tickPiratow as i64); ogolne.push(b2i(g.wygrana));
+    dopisz(&t, "los-numery-piraci", &ogolne);
+    var b: i64 = 0;
+    while (b < g.bazy.length()) {
+        var lb: List[i64];
+        lb.push(g.bazy.at(b).mysliwce as i64); lb.push(g.bazy.at(b).maks as i64);
+        lb.push(g.bazy.at(b).metal); lb.push(g.bazy.at(b).krysztal); lb.push(b2i(g.bazy.at(b).pokonana));
+        dopisz(&t, "baza", &lb);
+        b += 1;
+    }
+    var ile: List[i64];
+    ile.push(g.floty.length());
+    dopisz(&t, "floty", &ile);
+    var f: i64 = 0;
+    while (f < g.floty.length()) {
+        var lf: List[i64];
+        lf.push(g.floty.at(f).id); lf.push(b2i(g.floty.at(f).piracka)); lf.push(g.floty.at(f).baza as i64);
+        lf.push(g.floty.at(f).mysliwce as i64); lf.push(g.floty.at(f).transportowce as i64);
+        lf.push(g.floty.at(f).wylot); lf.push(g.floty.at(f).przylot); lf.push(g.floty.at(f).powrot);
+        lf.push(g.floty.at(f).stan as i64); lf.push(g.floty.at(f).metal); lf.push(g.floty.at(f).krysztal);
+        dopisz(&t, "flota", &lf);
+        f += 1;
+    }
+    var ileZ: List[i64];
+    ileZ.push(g.zdarzenia.length());
+    dopisz(&t, "zdarzenia", &ileZ);
+    var z: i64 = 0;
+    while (z < g.zdarzenia.length()) {
+        var lz: List[i64];
+        lz.push(g.zdarzenia.at(z).czas); lz.push(g.zdarzenia.at(z).nr);
+        lz.push(g.zdarzenia.at(z).typ as i64); lz.push(g.zdarzenia.at(z).a);
+        dopisz(&t, "zdarzenie", &lz);
+        z += 1;
+    }
+    var ileR: List[i64];
+    ileR.push(g.raporty.length());
+    dopisz(&t, "raporty", &ileR);
+    var r: i64 = 0;
+    while (r < g.raporty.length()) {
+        var lr: List[i64];
+        lr.push(g.raporty.at(r).czas); lr.push(g.raporty.at(r).typ as i64); lr.push(g.raporty.at(r).baza as i64);
+        lr.push(g.raporty.at(r).stratyMysliwcow as i64); lr.push(g.raporty.at(r).stratyTransportowcow as i64);
+        lr.push(g.raporty.at(r).stratyWroga as i64); lr.push(g.raporty.at(r).metal); lr.push(g.raporty.at(r).krysztal);
+        dopisz(&t, "raport", &lr);
+        r += 1;
+    }
+    return t;
+}
+
+# Wszystkie liczby całkowite z tekstu (z minusem), w kolejności; litery i myślniki w słowach pomijamy.
+fun liczbyZTekstu(tekst: str) -> List[i64] = {
+    var wynik: List[i64];
+    var biezaca: i64 = 0;
+    var cyfry = false;
+    var ujemna = false;
+    var poprzedni: u32 = 32u32;
+    var i: i64 = 0;
+    while (i <= tekst.length()) {
+        var znak: u32 = 32u32;
+        if (i < tekst.length()) znak = tekst[i] as u32;
+        if (znak >= 48u32 and znak <= 57u32) {
+            if (not cyfry) {
+                cyfry = true;
+                biezaca = 0;
+            }
+            biezaca = biezaca * 10 + ((znak - 48u32) as i64);
+        } else {
+            if (cyfry) {
+                if (ujemna) wynik.push(-biezaca);
+                else wynik.push(biezaca);
+            }
+            cyfry = false;
+            # Minus liczy się tylko po odstępie (myślnik w etykiecie to nie znak liczby).
+            ujemna = znak == 45u32 and (poprzedni == 32u32 or poprzedni == 10u32);
+        }
+        poprzedni = znak;
+        i += 1;
+    }
+    return wynik;
+}
+
+fun listaI64() -> List[i64] = { var l: List[i64]; return l; }
+
+class Czytnik {
+    liczby: List[i64] = listaI64();
+    pozycja: i64 = 0;
+    blad: bool = false;
+}
+
+fun nastepna(c: ref Czytnik) -> i64 = {
+    if (c.pozycja >= c.liczby.length()) {
+        c.blad = true;
+        return 0;
+    }
+    var v: i64 = c.liczby.at(c.pozycja);
+    c.pozycja += 1;
+    return v;
+}
+
+class WynikWczytania { ok: bool = false; gra: Gra = Gra(); }
+
+fun wczytajZTekstu(tekst: str) -> WynikWczytania = {
+    var wynik = WynikWczytania();
+    var c = Czytnik();
+    c.liczby = liczbyZTekstu(tekst);
+    var g = Gra();
+    let wersja = nastepna(&c);
+    g.czas = nastepna(&c); g.metal = nastepna(&c); g.krysztal = nastepna(&c);
+    g.resztaMetalu = nastepna(&c); g.resztaKrysztalu = nastepna(&c);
+    g.budynki.at(0) = nastepna(&c) as i32; g.budynki.at(1) = nastepna(&c) as i32; g.budynki.at(2) = nastepna(&c) as i32;
+    g.budowa = nastepna(&c) as i32; g.koniecBudowy = nastepna(&c);
+    g.mysliwce = nastepna(&c) as i32; g.transportowce = nastepna(&c) as i32; g.koniecStatku = nastepna(&c);
+    let wKolejce = nastepna(&c);
+    var q: i64 = 0;
+    while (q < wKolejce and not c.blad) { g.kolejkaStatkow.push(nastepna(&c) as i32); q += 1; }
+    g.los = nastepna(&c) as u64; g.nastepnyNr = nastepna(&c); g.nastepneId = nastepna(&c);
+    g.tickPiratow = nastepna(&c) as i32; g.wygrana = nastepna(&c) == 1;
+    var b: i32 = 0;
+    while (b < LICZBA_BAZ and not c.blad) {
+        let bm = nastepna(&c) as i32;
+        let bx = nastepna(&c) as i32;
+        let bmet = nastepna(&c);
+        let bkr = nastepna(&c);
+        let bp = nastepna(&c) == 1;
+        g.bazy.push(Baza(bm, bx, bmet, bkr, bp));
+        b += 1;
+    }
+    let ileFlot = nastepna(&c);
+    var f: i64 = 0;
+    while (f < ileFlot and not c.blad) {
+        var fl = Flota();
+        fl.id = nastepna(&c); fl.piracka = nastepna(&c) == 1; fl.baza = nastepna(&c) as i32;
+        fl.mysliwce = nastepna(&c) as i32; fl.transportowce = nastepna(&c) as i32;
+        fl.wylot = nastepna(&c); fl.przylot = nastepna(&c); fl.powrot = nastepna(&c);
+        fl.stan = nastepna(&c) as i32; fl.metal = nastepna(&c); fl.krysztal = nastepna(&c);
+        g.floty.push(fl);
+        f += 1;
+    }
+    let ileZdarzen = nastepna(&c);
+    var z: i64 = 0;
+    while (z < ileZdarzen and not c.blad) {
+        let zc = nastepna(&c);
+        let zn = nastepna(&c);
+        let zt = nastepna(&c) as i32;
+        let za = nastepna(&c);
+        g.zdarzenia.push(Zdarzenie(zc, zn, zt, za));
+        z += 1;
+    }
+    let ileRaportow = nastepna(&c);
+    var r: i64 = 0;
+    while (r < ileRaportow and not c.blad) {
+        let rc = nastepna(&c);
+        let rt = nastepna(&c) as i32;
+        let rb = nastepna(&c) as i32;
+        let rm = nastepna(&c) as i32;
+        let rtr = nastepna(&c) as i32;
+        let rw = nastepna(&c) as i32;
+        let rmet = nastepna(&c);
+        let rkr = nastepna(&c);
+        g.raporty.push(Raport(rc, rt, rb, rm, rtr, rw, rmet, rkr));
+        r += 1;
+    }
+    wynik.ok = not c.blad and wersja == 1 and c.pozycja == c.liczby.length();
+    if (wynik.ok) wynik.gra = move g;
+    return wynik;
+}
+
+# --- pliki (przenośne funkcje C: fopen, fwrite, fread, fclose) ---------------------------------------------------------
+
+extern("C") {
+    fundecl fopen(sciezka: cptr char, tryb: cptr char) -> cptr u8;
+    fundecl fwrite(dane: cptr char, rozmiar: u64, ile: u64, plik: cptr u8) -> u64;
+    fundecl fread(dane: cptr char, rozmiar: u64, ile: u64, plik: cptr u8) -> u64;
+    fundecl fclose(plik: cptr u8) -> i32;
+}
+
+fun napisC(tekst: str) -> String = {
+    var wynik: String;
+    wynik.append(tekst);
+    wynik.append('\0');
+    return wynik;
+}
+
+fun zapiszPlik(sciezka: str, tekst: ref String) -> bool = {
+    var nazwa = napisC(sciezka);
+    var tryb = napisC("w");
+    let plik = fopen(builtins.ptr_from_slice[char](nazwa.asSlice()) as cptr char, builtins.ptr_from_slice[char](tryb.asSlice()) as cptr char);
+    if (plik as u64 == 0u64) return false;
+    let dane = tekst.asSlice();
+    let zapisane = fwrite(builtins.ptr_from_slice[char](dane) as cptr char, 1u64, tekst.length() as u64, plik);
+    let zamkniety = fclose(plik) == 0i32;
+    return zapisane == tekst.length() as u64 and zamkniety;
+}
+
+class OdczytPliku { ok: bool = false; tekst: String; }
+
+fun wczytajPlik(sciezka: str) -> OdczytPliku = {
+    var wynik: OdczytPliku;
+    var nazwa = napisC(sciezka);
+    var tryb = napisC("r");
+    let plik = fopen(builtins.ptr_from_slice[char](nazwa.asSlice()) as cptr char, builtins.ptr_from_slice[char](tryb.asSlice()) as cptr char);
+    if (plik as u64 != 0u64) {
+        var bufor: char[256];
+        var dalej = true;
+        while (dalej) {
+            let n = fread(&bufor[0] as cptr char, 1u64, 256u64, plik);
+            var k: u64 = 0u64;
+            while (k < n) { wynik.tekst.append(bufor[k as i64]); k += 1u64; }
+            dalej = n == 256u64;
+        }
+        wynik.ok = fclose(plik) == 0i32;
+    }
+    return wynik;
+}
+
+fun zapiszGre(g: ref Gra, sciezka: str) -> bool = {
+    var tekst = zapiszDoTekstu(g);
+    return zapiszPlik(sciezka, &tekst);
+}
+
+fun wczytajGre(sciezka: str) -> WynikWczytania = {
+    let plik = wczytajPlik(sciezka);
+    if (not plik.ok) return WynikWczytania();
+    return wczytajZTekstu(plik.tekst.asSlice());
+}

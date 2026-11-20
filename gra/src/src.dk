@@ -1,0 +1,460 @@
+#{
+    DuckGalaxy: okno, klawiatura i rysowanie (pakiet grafika). Zasady są w pakiecie
+    duckgalaxy_logika; tu tylko zamieniamy klawisze na akcje i rysujemy stan gry.
+#}
+import grafika;
+import duckgalaxy_logika as model;
+import core.builtins as builtins;
+import core.containers.*;
+
+extern("C") {
+    fundecl write(fd: i32, data: cptr char, size: u64) -> i64;
+    fundecl getenv(name: cptr char) -> cptr char;
+}
+
+const OKNO_SZER: i32 = 1000;
+const OKNO_WYS: i32 = 690;
+const MAPA_X: i32 = 525;           # środek mapy (kolonia)
+const MAPA_Y: i32 = 290;
+let PLIK_ZAPISU = "duckgalaxy-zapis.txt";
+
+const TLO: u32 = 0x0b0e1affu32;
+const PANEL: u32 = 0x151a2bffu32;
+const RAMKA: u32 = 0x34405cffu32;
+const NAPIS: u32 = 0xc8d0dcffu32;
+const SZARY: u32 = 0x7c869affu32;
+const METAL: u32 = 0xb8c4d6ffu32;
+const KRYSZTAL: u32 = 0x7fd6ffffu32;
+
+fun bladNaEkran(tekst: str) -> () = {
+    write(2i32, builtins.ptr_from_slice[char](tekst) as cptr char, tekst.length() as u64);
+}
+
+fun napis(t: str, x: i32, y: i32, rozmiar: i32, kolor: u32) -> () = {
+    grafika.textDefault(t, x, y, rozmiar, kolor);
+}
+
+fun dwieCyfry(n: i64) -> String = {
+    if (n < 10) return f"0{n}";
+    return f"{n}";
+}
+
+fun czasTekst(sekundy: i64) -> String = {
+    let h = sekundy / 3600;
+    let m = (sekundy % 3600) / 60;
+    let s = sekundy % 60;
+    let mm = dwieCyfry(m);
+    let ss = dwieCyfry(s);
+    if (h > 0) return f"{h}:{mm}:{ss}";
+    return f"{mm}:{ss}";
+}
+
+# --- mapa -------------------------------------------------------------------------------------------
+
+class Punkt { x: f32 = 0.0; y: f32 = 0.0; }
+
+# Położenie bazy na mapie: kąt stały, odległość od kolonii rośnie z czasem lotu.
+fun polozenieBazy(b: i32) -> Punkt = {
+    var cos: f32 = 0.866f32;
+    var sin: f32 = -0.5f32;
+    if (b == 1) { cos = 0.5f32; sin = 0.866f32; }
+    if (b == 2) { cos = -0.94f32; sin = 0.342f32; }
+    if (b == 3) { cos = -0.342f32; sin = -0.94f32; }
+    let r = 60.0f32 + (model.odleglosc(b) as f32) / 2.4f32;
+    return Punkt((MAPA_X as f32) + r * cos, (MAPA_Y as f32) + r * sin);
+}
+
+fun miedzy(a: Punkt, b: Punkt, t: f32) -> Punkt = {
+    var u: f32 = t;
+    if (u < 0.0) u = 0.0;
+    if (u > 1.0) u = 1.0;
+    return Punkt(a.x + (b.x - a.x) * u, a.y + (b.y - a.y) * u);
+}
+
+fun rysujMape(g: ref model.Gra, wybrana: i32) -> () = {
+    grafika.rectangle(340, 60, 370, 450, PANEL);
+    grafika.rectangleLines(340, 60, 370, 450, 2.0, RAMKA);
+    napis("MAPA SEKTORA", 352, 68, 18, SZARY);
+    let kolonia = Punkt(MAPA_X as f32, MAPA_Y as f32);
+    var b: i32 = 0;
+    while (b < model.LICZBA_BAZ) {
+        let p = polozenieBazy(b);
+        grafika.line(kolonia.x, kolonia.y, p.x, p.y, 1.0, 0x2a3350ffu32);
+        b += 1;
+    }
+    # Floty: gracza błękitne, piratów czerwone.
+    var i: i64 = 0;
+    while (i < g.floty.length()) {
+        var f: model.Flota = g.floty.at(i);
+        let cel = polozenieBazy(f.baza);
+        var gdzie = kolonia;
+        if (f.piracka) {
+            let tp = ((g.czas - f.wylot) as f32) / ((f.przylot - f.wylot) as f32);
+            gdzie = miedzy(cel, kolonia, tp);
+            grafika.circle(gdzie.x as i32, gdzie.y as i32, 6.0, grafika.RED);
+        } else {
+            if (f.stan == model.LECI) {
+                let tl = ((g.czas - f.wylot) as f32) / ((f.przylot - f.wylot) as f32);
+                gdzie = miedzy(kolonia, cel, tl);
+            } else {
+                let tw = ((g.czas - f.przylot) as f32) / ((f.powrot - f.przylot) as f32);
+                gdzie = miedzy(cel, kolonia, tw);
+            }
+            grafika.circle(gdzie.x as i32, gdzie.y as i32, 6.0, grafika.SKYBLUE);
+        }
+        i += 1;
+    }
+    var k: i32 = 0;
+    while (k < model.LICZBA_BAZ) {
+        let pb = polozenieBazy(k);
+        var baza: model.Baza = g.bazy.at(k as i64);
+        var kolor: u32 = 0xd04a4affu32;
+        if (baza.pokonana) kolor = 0x4a5068ffu32;
+        if (k == wybrana) grafika.circleLines(pb.x as i32, pb.y as i32, 22.0, grafika.YELLOW);
+        grafika.circle(pb.x as i32, pb.y as i32, 15.0, kolor);
+        napis(model.nazwaBazy(k), (pb.x as i32) - 60, (pb.y as i32) + 20, 16, NAPIS);
+        if (baza.pokonana) napis("pokonana", (pb.x as i32) - 30, (pb.y as i32) + 38, 14, SZARY);
+        else {
+            let sila = f"{baza.mysliwce} mysl.";
+            napis(sila.asSlice(), (pb.x as i32) - 26, (pb.y as i32) + 38, 14, 0xff9a9affu32);
+        }
+        k += 1;
+    }
+    grafika.circle(kolonia.x as i32, kolonia.y as i32, 20.0, 0x3c8cf0ffu32);
+    grafika.circleLines(kolonia.x as i32, kolonia.y as i32, 26.0, 0x3c8cf080u32);
+    napis("Nowy Kaczogrod", (kolonia.x as i32) - 58, (kolonia.y as i32) + 30, 16, grafika.WHITE);
+}
+
+# --- panele ------------------------------------------------------------------------------------------
+
+fun pasek(x: i32, y: i32, szer: i32, ulamek: f32, kolor: u32) -> () = {
+    var u: f32 = ulamek;
+    if (u < 0.0) u = 0.0;
+    if (u > 1.0) u = 1.0;
+    grafika.rectangle(x, y, szer, 6, 0x262d44ffu32);
+    grafika.rectangle(x, y, ((szer as f32) * u) as i32, 6, kolor);
+}
+
+fun rysujKolonie(g: ref model.Gra) -> () = {
+    grafika.rectangle(20, 60, 310, 450, PANEL);
+    grafika.rectangleLines(20, 60, 310, 450, 2.0, RAMKA);
+    napis("KOLONIA", 32, 68, 18, SZARY);
+    var b: i32 = 0;
+    while (b < model.LICZBA_BUDYNKOW) {
+        let y = 96 + b * 62;
+        let naglowek = f"[{b + 1}] {model.nazwaBudynku(b)}";
+        napis(naglowek.asSlice(), 32, y, 18, grafika.WHITE);
+        let poz = f"poz. {model.poziom(g, b)}";
+        napis(poz.asSlice(), 252, y, 18, grafika.YELLOW);
+        let koszt = model.kosztRozbudowy(g, b);
+        if (g.budowa == b) {
+            let zostalo = g.koniecBudowy - g.czas;
+            let wToku = f"rozbudowa... {czasTekst(zostalo)}";
+            napis(wToku.asSlice(), 32, y + 22, 16, grafika.GREEN);
+            pasek(32, y + 42, 280, 1.0 - (zostalo as f32) / (koszt.czas as f32), grafika.GREEN);
+        } else {
+            var kolorKosztu: u32 = NAPIS;
+            if (g.metal < koszt.metal or g.krysztal < koszt.krysztal) kolorKosztu = SZARY;
+            let cena = f"koszt {koszt.metal} M / {koszt.krysztal} K, {czasTekst(koszt.czas)}";
+            napis(cena.asSlice(), 32, y + 22, 16, kolorKosztu);
+        }
+        b += 1;
+    }
+    napis("FLOTA W KOLONII", 32, 290, 18, SZARY);
+    let flota = f"Mysliwce: {g.mysliwce}   Transportowce: {g.transportowce}";
+    napis(flota.asSlice(), 32, 314, 18, grafika.WHITE);
+    let obrona = f"Dziala obrony (stocznia x 2): {model.dzialaKolonii(g)}";
+    napis(obrona.asSlice(), 32, 338, 16, NAPIS);
+    let km = model.kosztStatku(g, model.MYSLIWIEC);
+    let kt = model.kosztStatku(g, model.TRANSPORTOWIEC);
+    let zm = f"[Q] mysliwiec  {km.metal} M / {km.krysztal} K, {km.czas} s";
+    let zt = f"[W] transportowiec  {kt.metal} M / {kt.krysztal} K, {kt.czas} s";
+    napis(zm.asSlice(), 32, 372, 16, NAPIS);
+    napis(zt.asSlice(), 32, 394, 16, NAPIS);
+    napis("atak/panc./lad.: M 10/30/10, T 1/20/100", 32, 416, 13, SZARY);
+    if (g.kolejkaStatkow.length() > 0) {
+        var pierwszy: i32 = g.kolejkaStatkow.at(0);
+        let w = f"W stoczni: {g.kolejkaStatkow.length()} ({model.nazwaStatku(pierwszy)} za {czasTekst(g.koniecStatku - g.czas)})";
+        napis(w.asSlice(), 32, 446, 16, grafika.GREEN);
+        let kosztPierwszego = model.kosztStatku(g, pierwszy);
+        pasek(32, 468, 280, 1.0 - ((g.koniecStatku - g.czas) as f32) / (kosztPierwszego.czas as f32), grafika.GREEN);
+    } else {
+        napis("Stocznia wolna", 32, 446, 16, SZARY);
+    }
+}
+
+fun rysujWyprawe(g: ref model.Gra, wybrana: i32, wyslijM: i32, wyslijT: i32, komunikat: str) -> () = {
+    grafika.rectangle(720, 60, 260, 450, PANEL);
+    grafika.rectangleLines(720, 60, 260, 450, 2.0, RAMKA);
+    napis("WYPRAWA  [Tab] cel", 732, 68, 18, SZARY);
+    var baza: model.Baza = g.bazy.at(wybrana as i64);
+    napis(model.nazwaBazy(wybrana), 732, 96, 20, grafika.YELLOW);
+    let lot = f"lot {czasTekst(model.odleglosc(wybrana))} w jedna strone";
+    napis(lot.asSlice(), 732, 122, 16, NAPIS);
+    if (baza.pokonana) napis("Baza pokonana", 732, 144, 16, SZARY);
+    else {
+        let obr = f"Obroncy: {baza.mysliwce} mysliwcow";
+        napis(obr.asSlice(), 732, 144, 16, 0xff9a9affu32);
+        let zas = f"Zasoby: {baza.metal} M, {baza.krysztal} K";
+        napis(zas.asSlice(), 732, 166, 16, NAPIS);
+    }
+    let m = f"[gora/dol] mysliwce: {wyslijM}";
+    let t = f"[lewo/prawo] transport.: {wyslijT}";
+    napis(m.asSlice(), 732, 200, 16, grafika.WHITE);
+    napis(t.asSlice(), 732, 222, 16, grafika.WHITE);
+    let lad = f"ladownosc: {model.pojemnosc(wyslijM, wyslijT)}";
+    napis(lad.asSlice(), 732, 244, 16, NAPIS);
+    napis("[Enter] wyslij flote", 732, 270, 18, grafika.SKYBLUE);
+    napis(komunikat, 732, 298, 16, grafika.YELLOW);
+    napis("W LOCIE", 732, 330, 18, SZARY);
+    var y: i32 = 354;
+    var i: i64 = 0;
+    while (i < g.floty.length() and y < 490) {
+        var f: model.Flota = g.floty.at(i);
+        if (f.piracka) {
+            let wrog = f"! najazd: {f.mysliwce} mysl., za {czasTekst(f.przylot - g.czas)}";
+            napis(wrog.asSlice(), 732, y, 14, 0xff8080ffu32);
+        } else {
+            var cel = f.przylot;
+            var kierunek = "do";
+            if (f.stan == model.WRACA) { cel = f.powrot; kierunek = "z"; }
+            let nasza = f"{f.mysliwce}M {f.transportowce}T {kierunek} {model.nazwaBazy(f.baza)} {czasTekst(cel - g.czas)}";
+            napis(nasza.asSlice(), 732, y, 14, grafika.SKYBLUE);
+        }
+        y += 20;
+        i += 1;
+    }
+}
+
+fun opisRaportu(r: ref model.Raport) -> String = {
+    let kiedy = czasTekst(r.czas);
+    if (r.typ == model.R_BUDOWA) return f"[{kiedy}] {model.nazwaBudynku(r.baza)}: poziom {r.stratyMysliwcow}";
+    if (r.typ == model.R_STATEK) return f"[{kiedy}] Stocznia: gotowy {model.nazwaStatku(r.baza)}";
+    if (r.typ == model.R_ATAK_WYGRANY) return f"[{kiedy}] Atak na {model.nazwaBazy(r.baza)}: WYGRANA. Straty {r.stratyMysliwcow} mysl. {r.stratyTransportowcow} transp., wrog {r.stratyWroga}. Lup {r.metal} M, {r.krysztal} K";
+    if (r.typ == model.R_ATAK_PRZEGRANY) return f"[{kiedy}] Atak na {model.nazwaBazy(r.baza)}: PRZEGRANA. Straty {r.stratyMysliwcow} mysl. {r.stratyTransportowcow} transp., wrog {r.stratyWroga}";
+    if (r.typ == model.R_OBRONA_WYGRANA) return f"[{kiedy}] Najazd z {model.nazwaBazy(r.baza)} odparty! Straty {r.stratyMysliwcow} mysl., piraci stracili {r.stratyWroga}";
+    if (r.typ == model.R_OBRONA_PRZEGRANA) return f"[{kiedy}] Najazd z {model.nazwaBazy(r.baza)}: piraci zabrali {r.metal} M, {r.krysztal} K. Straty {r.stratyMysliwcow} mysl. {r.stratyTransportowcow} transp.";
+    if (r.typ == model.R_POWROT) return f"[{kiedy}] Powrot z {model.nazwaBazy(r.baza)}: {r.stratyMysliwcow} mysl., {r.stratyTransportowcow} transp., lup {r.metal} M, {r.krysztal} K";
+    if (r.typ == model.R_NAJAZD) return f"[{kiedy}] UWAGA: {r.stratyWroga} mysliwcow piratow z {model.nazwaBazy(r.baza)} leci na kolonie!";
+    return f"[{kiedy}]";
+}
+
+fun kolorRaportu(typ: i32) -> u32 = {
+    if (typ == model.R_ATAK_WYGRANY or typ == model.R_OBRONA_WYGRANA) return grafika.GREEN;
+    if (typ == model.R_ATAK_PRZEGRANY or typ == model.R_OBRONA_PRZEGRANA or typ == model.R_NAJAZD) return 0xff8080ffu32;
+    if (typ == model.R_POWROT) return grafika.SKYBLUE;
+    return NAPIS;
+}
+
+fun rysujRaporty(g: ref model.Gra) -> () = {
+    grafika.rectangle(20, 518, 960, 128, PANEL);
+    grafika.rectangleLines(20, 518, 960, 128, 2.0, RAMKA);
+    napis("RAPORTY", 32, 524, 16, SZARY);
+    var y: i32 = 544;
+    var i: i64 = g.raporty.length() - 1;
+    var pokazane: i32 = 0;
+    while (i >= 0 and pokazane < 5) {
+        var r: model.Raport = g.raporty.at(i);
+        let opis = opisRaportu(&r);
+        napis(opis.asSlice(), 32, y, 16, kolorRaportu(r.typ));
+        y += 20;
+        pokazane += 1;
+        i -= 1;
+    }
+}
+
+fun rysujGore(g: ref model.Gra, tempo: i32, pauza: bool) -> () = {
+    napis("DUCKGALAXY", 20, 16, 28, grafika.WHITE);
+    let czas = f"czas {czasTekst(g.czas)}";
+    napis(czas.asSlice(), 220, 20, 20, NAPIS);
+    if (pauza) napis("PAUZA", 380, 20, 20, grafika.YELLOW);
+    else {
+        let t = f"tempo x{tempo}";
+        napis(t.asSlice(), 380, 20, 20, grafika.GREEN);
+    }
+    let met = f"Metal {g.metal} (+{model.produkcjaMetalu(g)}/min)";
+    let kry = f"Krysztal {g.krysztal} (+{model.produkcjaKrysztalu(g)}/min)";
+    napis(met.asSlice(), 500, 22, 18, METAL);
+    napis(kry.asSlice(), 735, 22, 18, KRYSZTAL);
+}
+
+fun napisNaSrodku(t: str, y: i32, rozmiar: i32, kolor: u32) -> () = {
+    let pomiar = grafika.textDefaultWidth(t, rozmiar);
+    var lewy: i32 = 0;
+    if (pomiar._1 == grafika.OK) lewy = (OKNO_SZER - pomiar._2) / 2;
+    grafika.textDefault(t, lewy, y, rozmiar, kolor);
+}
+
+class Widok {
+    wybrana: i32 = 0;
+    wyslijM: i32 = 0;
+    wyslijT: i32 = 0;
+    tempo: i32 = 10;
+    pauza: bool = false;
+}
+
+fun rysujScene(g: ref model.Gra, w: ref Widok, komunikat: str) -> () = {
+    rysujGore(g, w.tempo, w.pauza);
+    rysujKolonie(g);
+    rysujMape(g, w.wybrana);
+    rysujWyprawe(g, w.wybrana, w.wyslijM, w.wyslijT, komunikat);
+    rysujRaporty(g);
+    napis("1/2/3 rozbudowa   Q/W statki   Tab cel   strzalki sklad floty   Enter wyslij   S zapisz   L wczytaj", 20, 652, 14, SZARY);
+    napis("Spacja pauza   7/8/9/0 tempo x1/x10/x60/x600   N do nastepnego zdarzenia   R nowa gra   Esc wyjscie", 20, 670, 14, SZARY);
+    if (g.wygrana) {
+        grafika.rectangle(0, 0, OKNO_SZER, OKNO_WYS, 0x000000b0u32);
+        napisNaSrodku("WYGRANA!", 250, 56, grafika.YELLOW);
+        napisNaSrodku("Wszystkie bazy piratow pokonane.", 330, 24, grafika.WHITE);
+        let wynik = f"Czas gry: {czasTekst(g.czas)}";
+        napisNaSrodku(wynik.asSlice(), 366, 22, NAPIS);
+        napisNaSrodku("R - nowa gra", 404, 20, NAPIS);
+    }
+}
+
+fun opisStatusu(status: i32) -> str = {
+    if (status == model.OK) return "OK";
+    if (status == model.ZAJETE) return "Trwa juz inna rozbudowa";
+    if (status == model.BRAK_ZASOBOW) return "Za malo zasobow";
+    if (status == model.BAZA_POKONANA) return "Ta baza jest juz pokonana";
+    return "Wybierz statki do wyslania";
+}
+
+# --- tryb zrzutów do README ---------------------------------------------------------------------------
+
+fun zrzutyWlaczone() -> bool = {
+    let wartosc: cptr char = getenv(builtins.ptr_from_slice[char]("DUCKGALAXY_ZRZUTY\0") as cptr char);
+    return wartosc as u64 != 0u64;
+}
+
+fun zapiszKlatke(g: ref model.Gra, w: ref Widok, komunikat: str, sciezka: str) -> i32 = {
+    grafika.frameBegin(TLO);
+    rysujScene(g, w, komunikat);
+    let zapis = grafika.frameSave(sciezka);
+    grafika.frameEnd();
+    return zapis;
+}
+
+# Ustalony przebieg gry do zrzutów: rozbudowa, statki, wyprawa i najazd piratów w toku.
+fun zapiszZrzuty() -> i32 = {
+    var g = model.nowaGra(2026u64);
+    var w = Widok();
+    model.rozbuduj(&g, model.KOPALNIA_METALU);
+    var n: i32 = 0;
+    while (n < 4) { model.zamowStatek(&g, model.MYSLIWIEC); n += 1; }
+    model.przewin(&g, 240);
+    let wszystkie = g.mysliwce;
+    model.wyslij(&g, 0, wszystkie, 0);
+    model.zamowStatek(&g, model.TRANSPORTOWIEC);
+    model.przewin(&g, 150);
+    model.rozbuduj(&g, model.KOPALNIA_KRYSZTALU);
+    model.przewin(&g, 30);
+    w.wyslijM = g.mysliwce;
+    w.wyslijT = g.transportowce;
+    w.wybrana = 1;
+    var bledy: i32 = 0;
+    if (zapiszKlatke(&g, &w, "", "zrzuty/gra.png") != grafika.OK) bledy += 1;
+    var m: i32 = 0;
+    while (m < 6) { model.zamowStatek(&g, model.MYSLIWIEC); m += 1; }
+    model.przewin(&g, 400);
+    model.rozbuduj(&g, model.STOCZNIA);
+    let druga = g.mysliwce;
+    model.wyslij(&g, 1, druga, g.transportowce);
+    model.przewin(&g, 560);
+    w.wyslijM = g.mysliwce;
+    w.wyslijT = g.transportowce;
+    if (zapiszKlatke(&g, &w, "", "zrzuty/pozniej.png") != grafika.OK) bledy += 1;
+    return bledy;
+}
+
+# --- pętla gry ----------------------------------------------------------------------------------------------
+
+fun main() = {
+    if (grafika.windowOpen(OKNO_SZER, OKNO_WYS, "DuckGalaxy") != grafika.OK) {
+        bladNaEkran("DuckGalaxy: nie mozna otworzyc okna (brak ekranu albo raylib).\n");
+        return 1;
+    }
+    grafika.setTargetFps(60);
+    if (zrzutyWlaczone()) {
+        let nieZapisane = zapiszZrzuty();
+        grafika.windowClose();
+        if (nieZapisane != 0) {
+            bladNaEkran("DuckGalaxy: nie zapisano zrzutow (czy istnieje katalog zrzuty/?).\n");
+            return 1;
+        }
+        return 0;
+    }
+
+    var g = model.nowaGra(grafika.random(1, 2147483646) as u64);
+    var w = Widok();
+    var input = grafika.InputState();
+    var komunikat = "Rozbuduj kopalnie i zbuduj mysliwce. Piraci atakuja co 6 minut!";
+    var naliczone: f32 = 0.0;
+
+    while (not input.closeRequested and not grafika.keyPressed(grafika.KEY_ESCAPE)) {
+        grafika.inputPoll(&input);
+        let dt = grafika.frameTime();
+
+        # Akcje gracza.
+        if (grafika.keyPressed(grafika.KEY_ONE)) komunikat = opisStatusu(model.rozbuduj(&g, model.KOPALNIA_METALU));
+        if (grafika.keyPressed(grafika.KEY_TWO)) komunikat = opisStatusu(model.rozbuduj(&g, model.KOPALNIA_KRYSZTALU));
+        if (grafika.keyPressed(grafika.KEY_THREE)) komunikat = opisStatusu(model.rozbuduj(&g, model.STOCZNIA));
+        if (grafika.keyPressed(grafika.KEY_Q)) komunikat = opisStatusu(model.zamowStatek(&g, model.MYSLIWIEC));
+        if (grafika.keyPressed(grafika.KEY_W)) komunikat = opisStatusu(model.zamowStatek(&g, model.TRANSPORTOWIEC));
+        if (grafika.keyPressed(grafika.KEY_TAB)) w.wybrana = (w.wybrana + 1) % model.LICZBA_BAZ;
+        if (grafika.keyPressed(grafika.KEY_UP)) w.wyslijM += 1;
+        if (grafika.keyPressed(grafika.KEY_DOWN)) w.wyslijM -= 1;
+        if (grafika.keyPressed(grafika.KEY_RIGHT)) w.wyslijT += 1;
+        if (grafika.keyPressed(grafika.KEY_LEFT)) w.wyslijT -= 1;
+        if (w.wyslijM > g.mysliwce) w.wyslijM = g.mysliwce;
+        if (w.wyslijM < 0) w.wyslijM = 0;
+        if (w.wyslijT > g.transportowce) w.wyslijT = g.transportowce;
+        if (w.wyslijT < 0) w.wyslijT = 0;
+        if (grafika.keyPressed(grafika.KEY_ENTER)) {
+            let s = model.wyslij(&g, w.wybrana, w.wyslijM, w.wyslijT);
+            if (s == model.OK) komunikat = "Flota wyslana";
+            else komunikat = opisStatusu(s);
+        }
+        if (grafika.keyPressed(grafika.KEY_SPACE)) w.pauza = not w.pauza;
+        if (grafika.keyPressed(grafika.KEY_SEVEN)) w.tempo = 1;
+        if (grafika.keyPressed(grafika.KEY_EIGHT)) w.tempo = 10;
+        if (grafika.keyPressed(grafika.KEY_NINE)) w.tempo = 60;
+        if (grafika.keyPressed(grafika.KEY_ZERO)) w.tempo = 600;
+        if (grafika.keyPressed(grafika.KEY_N)) model.doNastepnego(&g);
+        if (grafika.keyPressed(grafika.KEY_S)) {
+            if (model.zapiszGre(&g, PLIK_ZAPISU)) komunikat = "Zapisano gre (duckgalaxy-zapis.txt)";
+            else komunikat = "Nie udalo sie zapisac gry";
+        }
+        if (grafika.keyPressed(grafika.KEY_L)) {
+            var wczytana = model.wczytajGre(PLIK_ZAPISU);
+            if (wczytana.ok) {
+                g = copy wczytana.gra;
+                komunikat = "Wczytano gre";
+            } else {
+                komunikat = "Brak poprawnego zapisu";
+            }
+        }
+        if (grafika.keyPressed(grafika.KEY_R)) {
+            g = model.nowaGra(grafika.random(1, 2147483646) as u64);
+            komunikat = "Nowa gra";
+        }
+
+        # Upływ czasu gry: tempo razy czas klatki, w całych sekundach.
+        if (not w.pauza and not g.wygrana) {
+            var krok: f32 = dt;
+            if (krok > 0.1f32) krok = 0.1f32;
+            naliczone += krok * (w.tempo as f32);
+            let cale = naliczone as i64;
+            if (cale > 0) {
+                naliczone -= cale as f32;
+                model.przewin(&g, cale);
+            }
+        }
+
+        grafika.frameBegin(TLO);
+        rysujScene(&g, &w, komunikat);
+        grafika.frameEnd();
+    }
+
+    grafika.windowClose();
+    return 0;
+}

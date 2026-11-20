@@ -1,0 +1,12 @@
+metadata:
+  name: duckgalaxy_gra
+  version: '1.0.0'
+  license: MIT
+  description: DuckGalaxy - okno, klawiatura i rysowanie (pakiet grafika)
+dependencies:
+  duckgalaxy_logika:
+    source:
+      path: '../logika'
+  grafika:
+    source:
+      path: '../zewnetrzne/grafika'
