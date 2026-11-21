@@ -1,5 +1,7 @@
 # DuckGalaxy w Ducklingu
 
+![Napisane w Duckling](https://img.shields.io/badge/napisane%20w-Duckling-f2c94c)
+
 Kosmiczna gra strategiczna w czasie rzeczywistym (temat P04 konkursu DuckQuest), napisana w Ducklingu. Rozbudowujesz kolonię Nowy Kaczogród, budujesz flotę, wysyłasz wyprawy na cztery bazy piratów i bronisz się przed ich najazdami. Wygrywasz, gdy pokonasz wszystkie bazy.
 
 Okno, klawiatura i rysowanie pochodzą z pakietu `grafika` (raylib 5.5) z [duckling-biblioteki](https://github.com/andr729/duckling-biblioteki). Cała logika gry jest w osobnym pakiecie bez okna, więc można ją testować i przewijać czas o godziny w ułamku sekundy.
